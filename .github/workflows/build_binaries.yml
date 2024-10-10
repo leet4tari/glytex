@@ -205,6 +205,18 @@ jobs:
           # choco upgrade opencl-intel-cpu-runtime -y
           vcpkg.exe --triplet=x64-windows install opencl
 
+      - name: Install Windows ARM64 dependencies (opencl)
+        if: ${{ matrix.builds.name == 'opencl-windows-arm64' }}
+        shell: bash
+        run: |
+          vcpkg.exe --triplet=arm64-windows install opencl
+
+      - name: Install Windows ARM64 dependencies (opencl)
+        if: ${{ matrix.builds.target == 'aarch64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.builds.target }}
+
       - name: Install and setup cargo cross
         if: ${{ matrix.builds.cross }}
         shell: bash
