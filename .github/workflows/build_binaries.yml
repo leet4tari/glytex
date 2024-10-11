@@ -251,7 +251,7 @@ jobs:
             ${{ matrix.builds.flags }} \
             --bin ${{ env.TS_FILENAME }}
 
-      - name: Build release binaries
+      - name: Build release binaries (info)
         if: ${{ false }}
         shell: bash
         run: |
