@@ -1,6 +1,4 @@
-use crate::context_impl::ContextImpl;
-use crate::EngineImpl;
-use crate::FunctionImpl;
+use crate::gpu_status_file::GpuStatus;
 use anyhow::Error;
 #[cfg(feature = "nvidia")]
 use cust::{
@@ -9,8 +7,11 @@ use cust::{
     module::{ModuleJitOption, ModuleJitOption::DetermineTargetFromContext},
     prelude::{Module, *},
 };
-
+use log::{error, info, warn};
 use std::time::Instant;
+
+use crate::{context_impl::ContextImpl, EngineImpl, FunctionImpl};
+const LOG_TARGET: &str = "tari::gpuminer::cuda";
 #[derive(Clone)]
 pub struct CudaEngine {}
 
@@ -25,6 +26,7 @@ impl EngineImpl for CudaEngine {
     type Function = CudaFunction;
 
     fn init(&mut self) -> Result<(), anyhow::Error> {
+        info!(target: LOG_TARGET, "Init CUDA Engine");
         cust::init(CudaFlags::empty())?;
         Ok(())
     }
@@ -32,6 +34,24 @@ impl EngineImpl for CudaEngine {
     fn num_devices(&self) -> Result<u32, anyhow::Error> {
         let num_devices = Device::num_devices()?;
         Ok(num_devices)
+    }
+
+    fn detect_devices(&self) -> Result<Vec<GpuStatus>, anyhow::Error> {
+        let num_devices = Device::num_devices()?;
+        let mut devices = Vec::with_capacity(num_devices as usize);
+        for i in 0..num_devices {
+            let device = Device::get_device(i)?;
+            let name = device.name()?;
+            let gpu = GpuStatus {
+                device_name: name,
+                is_available: true,
+            };
+            devices.push(gpu);
+        }
+        if devices.len() > 0 {
+            return Ok(devices);
+        }
+        return Err(anyhow::anyhow!("No gpu device detected"));
     }
 
     fn create_context(&self, device_index: u32) -> Result<Self::Context, anyhow::Error> {
@@ -42,6 +62,7 @@ impl EngineImpl for CudaEngine {
     }
 
     fn create_main_function(&self, context: &Self::Context) -> Result<Self::Function, anyhow::Error> {
+        info!(target: LOG_TARGET, "Create CUDA main function");
         let module = Module::from_ptx(
             include_str!("../cuda/keccak.ptx"),
             &[ModuleJitOption::GenerateLineInfo(true)],
@@ -61,6 +82,7 @@ impl EngineImpl for CudaEngine {
         block_size: u32,
         grid_size: u32,
     ) -> Result<(Option<u64>, u32, u64), Error> {
+        info!(target: LOG_TARGET, "CUDA: start mining");
         let output = vec![0u64; 5];
         let mut output_buf = output.as_slice().as_dbuf()?;
 
@@ -103,7 +125,7 @@ impl EngineImpl for CudaEngine {
             unsafe {
                 output_buf.copy_to(&mut out1)?;
             }
-            //stream.synchronize()?;
+            // stream.synchronize()?;
 
             if out1[0] > 0 {
                 return Ok((Some((&out1[0]).clone()), grid_size * block_size * num_iterations, 0));
