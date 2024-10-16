@@ -4568,8 +4568,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "glytex"
-version = "0.1.13"
+name = "xtrgpuminer"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "axum",
