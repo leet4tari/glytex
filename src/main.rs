@@ -1,4 +1,16 @@
-use std::{cmp, convert::TryInto, env::current_dir, fs, path::PathBuf, str::FromStr, sync::Arc, thread, time::Instant};
+use std::{
+    any,
+    cmp,
+    convert::TryInto,
+    env::current_dir,
+    fs,
+    path::PathBuf,
+    process,
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context as AnyContext};
 use clap::Parser;
@@ -116,13 +128,12 @@ struct Cli {
     #[arg(long)]
     http_server_port: Option<u16>,
 
-    /// GPU percentage in values 1-1000, where 500 = 50%
-    #[arg(long, alias = "gpu-usage")]
-    gpu_percentage: Option<u16>,
+    #[arg(long, alias = "block-size")]
+    block_size: Option<u32>,
 
     /// grid_size for the gpu
     #[arg(long, alias = "grid-size")]
-    grid_size: Option<u32>,
+    grid_size: Option<String>,
     /// Coinbase extra data
     #[arg(long)]
     coinbase_extra: Option<String>,
@@ -168,60 +179,14 @@ async fn main_inner() -> Result<(), anyhow::Error> {
     }
 
     let benchmark = cli.benchmark;
-    let mut config = match ConfigFile::load(&cli.config.as_ref().cloned().unwrap_or_else(|| {
-        let mut path = current_dir().expect("no current directory");
-        path.push("config.json");
-        path
-    })) {
-        Ok(config) => {
-            info!(target: LOG_TARGET, "Config file loaded successfully");
-            config
-        },
-        Err(err) => {
-            eprintln!("Error loading config file: {}. Creating new one", err);
-            let default = ConfigFile::default();
-            let path = cli.config.unwrap_or_else(|| {
-                let mut path = current_dir().expect("no current directory");
-                path.push("config.json");
-                path
-            });
-            dbg!(&path);
-            fs::create_dir_all(path.parent().expect("no parent"))?;
-            default.save(&path).expect("Could not save default config");
-            default
-        },
-    };
-
-    if let Some(ref addr) = cli.tari_address {
-        config.tari_address = addr.clone();
-    }
-    if let Some(ref url) = cli.tari_node_url {
-        config.tari_node_url = url.clone();
-    }
-    if cli.p2pool_enabled {
-        config.p2pool_enabled = true;
-    }
-    if let Some(enabled) = cli.http_server_enabled {
-        config.http_server_enabled = enabled;
-    }
-    if let Some(port) = cli.http_server_port {
-        config.http_server_port = port;
-    }
-    if let Some(percentage) = cli.gpu_percentage {
-        config.gpu_percentage = percentage;
-    }
-    if let Some(grid_size) = cli.grid_size {
-        config.grid_size = grid_size;
-    }
-    if let Some(coinbase_extra) = cli.coinbase_extra {
-        config.coinbase_extra = coinbase_extra;
-    }
-
-    if let Some(template_timeout) = cli.template_timeout_secs {
-        config.template_timeout_secs = template_timeout;
-    }
 
     let submit = true;
+
+    #[cfg(not(any(feature = "nvidia", feature = "opencl3")))]
+    {
+        eprintln!("No GPU engine available");
+        process::exit(1);
+    }
 
     #[cfg(feature = "nvidia")]
     let mut gpu_engine = GpuEngine::new(CudaEngine::new());
@@ -229,146 +194,206 @@ async fn main_inner() -> Result<(), anyhow::Error> {
     #[cfg(feature = "opencl3")]
     let mut gpu_engine = GpuEngine::new(OpenClEngine::new());
 
-    gpu_engine.init().unwrap();
+    #[cfg(any(feature = "nvidia", feature = "opencl3"))]
+    {
+        gpu_engine.init().unwrap();
 
-    // http server
-    let mut shutdown = Shutdown::new();
-    let (stats_tx, stats_rx) = tokio::sync::broadcast::channel(100);
-    if config.http_server_enabled {
-        let mut stats_collector = stats_collector::StatsCollector::new(shutdown.to_signal(), stats_rx);
-        let stats_client = stats_collector.create_client();
-        info!(target: LOG_TARGET, "Stats collector started");
-        tokio::spawn(async move {
-            stats_collector.run().await;
-            info!(target: LOG_TARGET, "Stats collector shutdown");
-        });
-        let http_server_config = Config::new(config.http_server_port);
-        info!(target: LOG_TARGET, "HTTP server runs on port: {}", &http_server_config.port);
-        let http_server = HttpServer::new(shutdown.to_signal(), http_server_config, stats_client);
-        info!(target: LOG_TARGET, "HTTP server enabled");
-        tokio::spawn(async move {
-            if let Err(error) = http_server.start().await {
-                println!("Failed to start HTTP server: {error:?}");
-                error!(target: LOG_TARGET, "Failed to start HTTP server: {:?}", error);
-            } else {
-                info!(target: LOG_TARGET, "Success to start HTTP server");
+        // http server
+        let mut shutdown = Shutdown::new();
+
+        let num_devices = gpu_engine.num_devices()?;
+
+        // just create the context to test if it can run
+        if let Some(_detect) = cli.detect {
+            let gpu = gpu_engine.clone();
+
+            let gpu_devices = match gpu.detect_devices() {
+                Ok(gpu_stats) => gpu_stats,
+                Err(error) => {
+                    warn!(target: LOG_TARGET, "No gpu device detected");
+                    return Err(anyhow::anyhow!("Gpu detect error: {:?}", error));
+                },
+            };
+
+            let any_gpu_available = gpu_devices.iter().any(|g| g.is_available);
+            let status_file = GpuStatusFile::new(gpu_devices);
+            let default_path = {
+                let mut path = current_dir().expect("no current directory");
+                path.push("gpu_status.json");
+                path
+            };
+            let path = cli.gpu_status_file.unwrap_or_else(|| default_path.clone());
+
+            let _ = match GpuStatusFile::load(&path) {
+                Ok(_) => {
+                    if let Err(err) = status_file.save(&path) {
+                        warn!(target: LOG_TARGET,"Error saving gpu status: {}", err);
+                    }
+                    status_file
+                },
+                Err(err) => {
+                    if let Err(err) = fs::create_dir_all(path.parent().expect("no parent")) {
+                        warn!(target: LOG_TARGET, "Error creating directory: {}", err);
+                    }
+                    if let Err(err) = status_file.save(&path) {
+                        warn!(target: LOG_TARGET,"Error saving gpu status: {}", err);
+                    }
+                    status_file
+                },
+            };
+
+            if any_gpu_available {
+                return Ok(());
             }
-        });
-    }
-
-    let num_devices = gpu_engine.num_devices()?;
-
-    // just create the context to test if it can run
-    if let Some(_detect) = cli.detect {
-        let gpu = gpu_engine.clone();
-        let mut is_any_available = false;
-
-        let mut gpu_devices = match gpu.detect_devices() {
-            Ok(gpu_stats) => gpu_stats,
-            Err(error) => {
-                warn!(target: LOG_TARGET, "No gpu device detected");
-                return Err(anyhow::anyhow!("Gpu detect error: {:?}", error));
-            },
-        };
-        if num_devices > 0 {
-            for i in 0..num_devices {
-                match gpu.create_context(i) {
-                    Ok(_) => {
-                        info!(target: LOG_TARGET, "Gpu detected. Created context for device nr: {:?}", i+1);
-                        if let Some(gpstat) = gpu_devices.get_mut(i as usize) {
-                            gpstat.is_available = true;
-                            is_any_available = true;
-                        }
-                    },
-                    Err(error) => {
-                        warn!(target: LOG_TARGET, "Failed to create context for gpu device nr: {:?}", i+1);
-                        continue;
-                    },
-                }
-            }
+            return Err(anyhow::anyhow!("No available gpu device detected"));
         }
 
-        let status_file = GpuStatusFile::new(gpu_devices);
-        let default_path = {
+        let mut config = match ConfigFile::load(&cli.config.as_ref().cloned().unwrap_or_else(|| {
             let mut path = current_dir().expect("no current directory");
-            path.push("gpu_status.json");
+            path.push("config.json");
             path
-        };
-        let path = cli.gpu_status_file.unwrap_or_else(|| default_path.clone());
-
-        let _ = match GpuStatusFile::load(&path) {
-            Ok(_) => {
-                if let Err(err) = status_file.save(&path) {
-                    warn!(target: LOG_TARGET,"Error saving gpu status: {}", err);
-                }
-                status_file
+        })) {
+            Ok(config) => {
+                info!(target: LOG_TARGET, "Config file loaded successfully");
+                config
             },
             Err(err) => {
-                if let Err(err) = fs::create_dir_all(path.parent().expect("no parent")) {
-                    warn!(target: LOG_TARGET, "Error creating directory: {}", err);
-                }
-                if let Err(err) = status_file.save(&path) {
-                    warn!(target: LOG_TARGET,"Error saving gpu status: {}", err);
-                }
-                status_file
+                eprintln!("Error loading config file: {}. Creating new one", err);
+                let default = ConfigFile::default();
+                let path = cli.config.unwrap_or_else(|| {
+                    let mut path = current_dir().expect("no current directory");
+                    path.push("config.json");
+                    path
+                });
+                dbg!(&path);
+                fs::create_dir_all(path.parent().expect("no parent"))?;
+                default.save(&path).expect("Could not save default config");
+                default
             },
         };
 
-        if is_any_available {
-            return Ok(());
+        if let Some(ref addr) = cli.tari_address {
+            config.tari_address = addr.clone();
         }
-        return Err(anyhow::anyhow!("No available gpu device detected"));
-    }
-
-    // create a list of devices (by index) to use
-    let devices_to_use: Vec<u32> = (0..num_devices)
-        .filter(|x| {
-            if let Some(use_devices) = &cli.use_devices {
-                use_devices.contains(x)
+        if let Some(ref url) = cli.tari_node_url {
+            config.tari_node_url = url.clone();
+        }
+        if cli.p2pool_enabled {
+            config.p2pool_enabled = true;
+        }
+        if let Some(enabled) = cli.http_server_enabled {
+            config.http_server_enabled = enabled;
+        }
+        if let Some(port) = cli.http_server_port {
+            config.http_server_port = port;
+        }
+        if let Some(block_size) = cli.block_size {
+            config.block_size = block_size;
+        }
+        if let Some(grid_size) = cli.grid_size {
+            let sizes: Vec<u32> = grid_size.split(',').map(|s| s.parse::<u32>().unwrap()).collect();
+            if sizes.len() == 1 {
+                config.single_grid_size = sizes[0];
             } else {
-                true
+                config.per_device_grid_sizes = sizes;
             }
-        })
-        .filter(|x| {
-            if let Some(excluded_devices) = &cli.exclude_devices {
-                !excluded_devices.contains(x)
-            } else {
-                true
+        }
+        if let Some(coinbase_extra) = cli.coinbase_extra {
+            config.coinbase_extra = coinbase_extra;
+        }
+
+        if let Some(template_timeout) = cli.template_timeout_secs {
+            config.template_timeout_secs = template_timeout;
+        }
+
+        let (stats_tx, stats_rx) = tokio::sync::broadcast::channel(100);
+        if config.http_server_enabled {
+            let mut stats_collector = stats_collector::StatsCollector::new(shutdown.to_signal(), stats_rx);
+            let stats_client = stats_collector.create_client();
+            info!(target: LOG_TARGET, "Stats collector started");
+            tokio::spawn(async move {
+                stats_collector.run().await;
+                info!(target: LOG_TARGET, "Stats collector shutdown");
+            });
+            let http_server_config = Config::new(config.http_server_port);
+            info!(target: LOG_TARGET, "HTTP server runs on port: {}", &http_server_config.port);
+            let http_server = HttpServer::new(shutdown.to_signal(), http_server_config, stats_client);
+            info!(target: LOG_TARGET, "HTTP server enabled");
+            tokio::spawn(async move {
+                if let Err(error) = http_server.start().await {
+                    println!("Failed to start HTTP server: {error:?}");
+                    error!(target: LOG_TARGET, "Failed to start HTTP server: {:?}", error);
+                } else {
+                    info!(target: LOG_TARGET, "Success to start HTTP server");
+                }
+            });
+        }
+        // create a list of devices (by index) to use
+        let devices_to_use: Vec<u32> = (0..num_devices)
+            .filter(|x| {
+                if let Some(use_devices) = &cli.use_devices {
+                    use_devices.contains(x)
+                } else {
+                    true
+                }
+            })
+            .filter(|x| {
+                if let Some(excluded_devices) = &cli.exclude_devices {
+                    !excluded_devices.contains(x)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        info!(target: LOG_TARGET, "Device indexes to use: {:?} from the total number of devices: {:?}", devices_to_use, num_devices);
+
+        let mut threads = vec![];
+        for i in 0..num_devices {
+            if devices_to_use.contains(&i) {
+                let c = config.clone();
+                let gpu = gpu_engine.clone();
+                let curr_stats_tx = stats_tx.clone();
+                threads.push(thread::spawn(move || {
+                    run_thread(gpu, num_devices as u64, i as u32, c, benchmark, curr_stats_tx)
+                }));
             }
-        })
-        .collect();
-
-    info!(target: LOG_TARGET, "Device indexes to use: {:?} from the total number of devices: {:?}", devices_to_use, num_devices);
-
-    let mut threads = vec![];
-    for i in 0..num_devices {
-        if devices_to_use.contains(&i) {
-            let c = config.clone();
-            let gpu = gpu_engine.clone();
-            let curr_stats_tx = stats_tx.clone();
-            threads.push(thread::spawn(move || {
-                run_thread(gpu, num_devices as u64, i as u32, c, benchmark, curr_stats_tx)
-            }));
         }
-    }
 
-    // for t in threads {
-    //     t.join().unwrap()?;
-    // }
-    // let mut res = Ok(());
-    for t in threads {
-        if let Err(err) = t.join() {
-            error!(target: LOG_TARGET, "Thread join failed: {:?}", err);
-            // if res.is_ok() {
-            // res = Err(anyhow!(err));
-            // }
-            // err?;
+        // for t in threads {
+        //     t.join().unwrap()?;
+        // }
+        // let mut res = Ok(());
+        let thread_len = threads.len();
+        let mut thread_hashrate = Vec::with_capacity(thread_len);
+        for t in threads {
+            match t.join() {
+                Ok(res) => match res {
+                    Ok(hashrate) => {
+                        info!(target: LOG_TARGET, "Thread join succeeded: {}", hashrate.to_formatted_string(&Locale::en));
+                        thread_hashrate.push(hashrate);
+                    },
+                    Err(err) => {
+                        error!(target: LOG_TARGET, "Thread join succeeded but result failed: {:?}", err);
+                    },
+                },
+                Err(err) => {
+                    error!(target: LOG_TARGET, "Thread join failed: {:?}", err);
+                },
+            }
         }
+
+        // kill other threads
+        shutdown.trigger();
+        if thread_hashrate.len() == thread_len {
+            let total_hashrate: u64 = thread_hashrate.iter().sum();
+            warn!(target: LOG_TARGET, "Total hashrate: {}", total_hashrate.to_formatted_string(&Locale::en));
+        } else {
+            error!(target: LOG_TARGET, "Not all threads finished successfully");
+        }
+
+        Ok(())
     }
-
-    shutdown.trigger();
-
-    Ok(())
 }
 
 fn run_thread<T: EngineImpl>(
@@ -378,7 +403,7 @@ fn run_thread<T: EngineImpl>(
     config: ConfigFile,
     benchmark: bool,
     stats_tx: Sender<HashrateSample>,
-) -> Result<(), anyhow::Error> {
+) -> Result<u64, anyhow::Error> {
     let tari_node_url = config.tari_node_url.clone();
     let runtime = Runtime::new()?;
     let client_type = if benchmark {
@@ -393,6 +418,7 @@ fn run_thread<T: EngineImpl>(
         node_client::create_client(client_type, &tari_node_url, coinbase_extra).await
     })?));
     let mut rounds = 0;
+    let running_time = Instant::now();
 
     let context = gpu_engine.create_context(thread_index)?;
 
@@ -402,15 +428,18 @@ fn run_thread<T: EngineImpl>(
     //    .suggested_launch_configuration()
     //    .context("get suggest config")?;
     // let (grid_size, block_size) = (23, 50);
-    let (mut grid_size, block_size) = (config.grid_size, 896);
+    let block_size = config.block_size;
+    let grid_size = if config.per_device_grid_sizes.is_empty() {
+        config.single_grid_size
+    } else {
+        config.per_device_grid_sizes[thread_index as usize]
+    };
     // grid_size =
     //    (grid_size as f64 / 1000f64 * cmp::max(cmp::min(100, config.gpu_percentage as usize), 1) as f64).round() as
     // u32; let (mut grid_size, block_size) = gpu_function
     //     .suggested_launch_configuration()
     //     .context("get suggest config")?;
     // let (grid_size, block_size) = (23, 50);
-    grid_size = (grid_size as f64 / 1000f64 * cmp::max(cmp::min(1000, config.gpu_percentage as usize), 1) as f64)
-        .round() as u32;
 
     let output = vec![0u64; 5];
     // let mut output_buf = output.as_slice().as_dbuf()?;
@@ -422,6 +451,7 @@ fn run_thread<T: EngineImpl>(
 
     loop {
         rounds += 1;
+
         if rounds > 101 {
             rounds = 0;
         }
@@ -475,6 +505,10 @@ fn run_thread<T: EngineImpl>(
         let mut last_printed = Instant::now();
         let mut last_reported_stats = Instant::now();
         loop {
+            if running_time.elapsed() > Duration::from_secs(10) && benchmark {
+                let hash_rate = (nonce_start - first_nonce) / elapsed.elapsed().as_secs();
+                return Ok(hash_rate);
+            }
             debug!(target: LOG_TARGET, "Inside loop");
             if elapsed.elapsed().as_secs() > config.template_refresh_secs {
                 debug!(target: LOG_TARGET, "Elapsed {:?} > {:?}", elapsed.elapsed().as_secs(), config.template_refresh_secs );
@@ -574,7 +608,6 @@ fn run_thread<T: EngineImpl>(
                         println!("Error submitting block: {:?}", e);
                     },
                 }
-                debug!(target: LOG_TARGET, "Inside thread loop (nonce) break {:?}", num_threads);
                 break;
             }
             debug!(target: LOG_TARGET, "Inside thread loop break {:?}", num_threads);
@@ -628,6 +661,7 @@ async fn get_template(
             .try_into()
             .map_err(|s: String| anyhow!(s))?;
         let mining_hash = header.mining_hash().clone();
+        header.timestamp = EpochTime::now();
         info!(target: LOG_TARGET,
             "block result target difficulty: {}, block timestamp: {}, mining_hash: {}",
             block_result.target_difficulty.to_string(),

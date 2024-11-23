@@ -202,8 +202,11 @@ jobs:
           # Bug in choco - need to install each package individually
           choco upgrade llvm -y
           choco upgrade protoc -y
+          choco install openssl -y
           # choco upgrade opencl-intel-cpu-runtime -y
           vcpkg.exe --triplet=x64-windows install opencl
+          # openssl install stupidness
+          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $GITHUB_ENV
 
       - name: Install and setup cargo cross
         if: ${{ matrix.builds.cross }}

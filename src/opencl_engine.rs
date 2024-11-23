@@ -70,24 +70,45 @@ impl EngineImpl for OpenClEngine {
         let mut total_devices = 0;
         let mut gpu_devices: Vec<GpuStatus> = vec![];
         let lock = self.inner.read().unwrap();
-        for platform in lock.platforms.iter() {
+        let platforms = lock.platforms.clone();
+        drop(lock);
+        for platform in platforms.iter() {
             let devices = platform.get_devices(CL_DEVICE_TYPE_GPU)?;
 
             debug!(target: LOG_TARGET, "OpenClEngine: platform name: {}", platform.name()?);
             println!("List of the devices for the Platform: {}", platform.name()?);
-            for device in devices {
+            // drop(lock);
+            for (id, device) in devices.into_iter().enumerate() {
                 let dev = Device::new(device);
                 let name = dev.name().unwrap_or_default() as String;
                 debug!(target: LOG_TARGET, "Device index {:?}: {}", total_devices, &name);
                 println!("device: {}", &name);
                 let mut gpu = GpuStatus {
                     device_name: name,
+                    device_index: id as u32,
                     is_available: true,
+                    max_grid_size: dev.max_work_group_size().unwrap_or_default() as u32,
+                    grid_size: 0,
+                    block_size: 0,
                 };
-                gpu_devices.push(gpu);
-                total_devices += 1;
-                debug!(target: LOG_TARGET, "Device nr {:?}: {}", total_devices, dev.name()?);
-                println!("Device nr {:?}: {}", total_devices, dev.name()?);
+                if let Ok(context) = self
+                    .create_context(u32::try_from(id).unwrap())
+                    .inspect_err(|e| error!(target: LOG_TARGET, "Could not create context {:?}", e))
+                {
+                    if let Ok(func) = self
+                        .create_main_function(&context)
+                        .inspect_err(|e| error!(target: LOG_TARGET, "Could not create function {:?}", e))
+                    {
+                        if let Ok((grid, block)) = func.suggested_launch_configuration(&dev) {
+                            gpu.grid_size = grid;
+                            gpu.block_size = block;
+                        }
+                        gpu_devices.push(gpu);
+                        total_devices += 1;
+                        debug!(target: LOG_TARGET, "Device nr {:?}: {}", total_devices, dev.name()?);
+                        println!("Device nr {:?}: {}", total_devices, dev.name()?);
+                    }
+                }
             }
         }
         if total_devices > 0 {
@@ -150,12 +171,12 @@ impl EngineImpl for OpenClEngine {
 
             let batch_size = 1 << 19; // According to tests, but we can try work this out
             let global_dimensions = [batch_size as usize];
-            let max_workgroups = Device::new(context.context.devices()[0]).max_work_group_size().unwrap();
+            // let max_workgroups = Device::new(context.context.devices()[0]).max_work_group_size().unwrap();
             // dbg!(max_compute);
             // let max_work_items = queue.max_work_item_dimensions();
             // dbg!(max_work_items);
             // dbg!("here");
-            debug!(target: LOG_TARGET, "OpenClEngine: cmax workgroups {:?}", max_workgroups);
+            // debug!(target: LOG_TARGET, "OpenClEngine: cmax workgroups {:?}", max_workgroups);
 
             let mut buffer =
                 match Buffer::<cl_ulong>::create(&context.context, CL_MEM_READ_ONLY, data.len(), ptr::null_mut()) {
@@ -298,7 +319,12 @@ pub struct OpenClFunction {
     program: Program,
 }
 impl FunctionImpl for OpenClFunction {
-    fn suggested_launch_configuration(&self) -> Result<(u32, u32), anyhow::Error> {
-        Ok((1000, 1000))
+    type Device = Device;
+
+    fn suggested_launch_configuration(&self, device: &Self::Device) -> Result<(u32, u32), anyhow::Error> {
+        let kernel = Kernel::create(&self.program, "sha3")?;
+        // let threads = device.max_compute_units()? as u32;
+        Ok((kernel.get_work_group_size(device.id())? as u32, 1000))
+        // self.program.build(vec![&device], "")?.Ok((1000, 1000))
     }
 }
