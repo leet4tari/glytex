@@ -4810,7 +4810,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xtrgpuminer"
+name = "glytex"
 version = "0.2.7"
 dependencies = [
  "anyhow",
