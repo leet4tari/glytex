@@ -45,10 +45,10 @@
   },
   {
     "name": "combined-linux-arm64",
-    "runs-on": "ubuntu-latest",
+    "runs-on": "ubuntu-24.04-arm",
     "rust": "nightly-2024-07-07",
     "target": "aarch64-unknown-linux-gnu",
-    "cross": true,
+    "cross": false,
     "features": "nvidia,opencl",
     "build_enabled": true,
     "best_effort": true
@@ -68,14 +68,6 @@
     "target": "aarch64-apple-darwin",
     "cross": false,
     "features": "metal"
-  },
-  {
-    "name": "combined-macos-x86_64",
-    "runs-on": "macos-13",
-    "rust": "stable",
-    "target": "x86_64-apple-darwin",
-    "cross": false,
-    "features": "opencl"
   },
   {
     "name": "combined-macos-arm64",
