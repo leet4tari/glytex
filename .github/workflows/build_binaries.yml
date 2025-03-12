@@ -8,6 +8,8 @@ name: Build Matrix of Binaries
     branches:
       - main
       - build-*
+  schedule:
+    - cron: "15 01 * * 0" # Every Sunday at 01h15
   workflow_dispatch:
     inputs:
       tariNetwork:
@@ -300,6 +302,15 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Audit tree and feedback for binaries
+        # if: ${{ ( ! matrix.builds.cross ) }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "${{ github.workspace }}/target/${{ matrix.builds.target }}/${{ env.TS_BUILD }}/"
+          echo "Audit binaries ..."
+          cargo audit bin ${{ env.TS_FILENAME }}*
 
       - name: Archive and Checksum Binaries
         shell: bash
