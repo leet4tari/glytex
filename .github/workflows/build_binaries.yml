@@ -8,6 +8,8 @@ name: Build Matrix of Binaries
     branches:
       - main
       - build-*
+  schedule:
+    - cron: "15 01 * * 0" # Every Sunday at 01h15
   workflow_dispatch:
     inputs:
       tariNetwork:
@@ -31,7 +33,7 @@ env:
 concurrency:
   # https://docs.github.com/en/actions/examples/using-concurrency-expressions-and-a-test-matrix
   group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') || github.ref != 'refs/heads/development' || github.ref != 'refs/heads/nextnet' || github.ref != 'refs/heads/stagenet' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/heads/main' }}
 
 permissions: {}
 
@@ -155,7 +157,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install nVida cuda toolkit
-        uses: jimver/cuda-toolkit@v0.2.16
+        uses: jimver/cuda-toolkit@v0.2.22
         if: contains(matrix.builds.features, 'nvidia')
         with:
           method: network
@@ -186,10 +188,12 @@ jobs:
           # Force static openssl libs
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           if [ -f /opt/homebrew/opt/openssl/README.md ]; then
+            # arm64
             ls -la /opt/homebrew/opt/openssl/
             echo "OPENSSL_LIB_DIR=/opt/homebrew/opt/openssl/lib" >> $GITHUB_ENV
             echo "OPENSSL_INCLUDE_DIR=/opt/homebrew/opt/openssl/include" >> $GITHUB_ENV
           else
+            # x86_64
             ls -la /usr/local/opt/openssl/
             echo "OPENSSL_LIB_DIR=/usr/local/opt/openssl/lib" >> $GITHUB_ENV
             echo "OPENSSL_INCLUDE_DIR=/usr/local/opt/openssl/include" >> $GITHUB_ENV
@@ -238,7 +242,6 @@ jobs:
           echo "CROSS_NO_WARNINGS=0" >> $GITHUB_ENV
 
       - name: Install and setup cargo-auditable
-        # if: ${{ ( startsWith(github.ref, 'refs/tags/v') ) && ( ! matrix.builds.cross ) }}
         if: ${{ ( ! matrix.builds.cross ) }}
         shell: bash
         run: |
@@ -246,7 +249,6 @@ jobs:
           echo "CARGO=${{ env.CARGO }} auditable" >> $GITHUB_ENV
 
       - name: Build release targets
-        # if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         shell: bash
         run: |
           # echo "TS_BUILD=release" >> $GITHUB_ENV
@@ -285,7 +287,7 @@ jobs:
         if: ${{ ( startsWith(runner.os,'Windows') ) && ( env.AZURE_TENANT_ID != '' ) }}
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-        uses: azure/trusted-signing-action@v0.4.0
+        uses: azure/trusted-signing-action@v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -299,10 +301,67 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Verify Windows signing for executibles
+        if: ${{ ( startsWith(runner.os,'Windows') ) && ( env.AZURE_TENANT_ID != '' ) }}
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        shell: powershell
+        working-directory: ${{ github.workspace }}/target/${{ matrix.builds.target }}/${{ env.TS_BUILD }}/
+        run: |
+          # Get the Program Files (x86) directory dynamically
+          $programFilesX86 = [System.Environment]::GetFolderPath("ProgramFilesX86")
+          $sdkBasePath = Join-Path $programFilesX86 "Windows Kits"
+
+          # Check if Windows Kits exists
+          if (-Not (Test-Path $sdkBasePath)) {
+            Write-Error "Windows Kits folder not found at $sdkBasePath!"
+            exit 1
+          }
+
+          Write-Output "Searching for signtool.exe in: $sdkBasePath"
+
+          # Search for signtool.exe within Windows Kits fold with x64 in the path
+          $signtoolPath = Get-ChildItem -Path $sdkBasePath -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                          Where-Object { $_.FullName -match '\\x64\\' } |
+                          Select-Object -ExpandProperty FullName -First 1
+
+          if (-not $signtoolPath) {
+            Write-Error "signtool.exe not found in Windows Kits folder!"
+            exit 1
+          }
+
+          Write-Output "Found signtool.exe at: $signtoolPath"
+
+          $Signature = Get-AuthenticodeSignature ${{ env.TS_FILENAME }}.exe
+
+          # Display results
+          Write-Host "File: ${{ env.TS_FILENAME }}.exe"
+          Write-Host "  - Status: $($Signature.Status)"
+          Write-Host "  - Status Message: $($Signature.StatusMessage)"
+          Write-Host "  - Signer: $($Signature.SignerCertificate.Subject)"
+          Write-Host "  - Issuer: $($Signature.SignerCertificate.Issuer)"
+          Write-Host "---------------------------------------------"
+
+          & $signtoolPath verify /pa "${{ env.TS_FILENAME }}.exe"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "!! Signature verification failed for ${{ env.TS_FILENAME }}.exe !!"
+            exit 1
+          }
+
+      - name: Audit tree and feedback for binaries
+        if: ${{ ( ! matrix.builds.cross ) }}
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ github.workspace }}/target/${{ matrix.builds.target }}/${{ env.TS_BUILD }}/
+        run: |
+          echo "Audit binaries ..."
+          ls -la
+          cargo audit bin ${{ env.TS_FILENAME }}${{ env.TS_EXT }}
+
       - name: Archive and Checksum Binaries
         shell: bash
         run: |
-          set -xo pipefail
+          # set -xo pipefail
           mkdir -p "$GITHUB_WORKSPACE/DIST"
           cd "$GITHUB_WORKSPACE/DIST"
           echo "Copying files for ${{ env.BINFILE }} to $(pwd)"
