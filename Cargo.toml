@@ -1,6 +1,6 @@
 [package]
 name = "glytex"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2021"
 
 [dependencies]
@@ -41,4 +41,4 @@ metal = ["dep:metal"]
 opencl = ["dep:opencl3"]
 
 [package.metadata.cargo-machete]
-ignored = ["libsqlite3-sys","log4rs"]
+ignored = ["libsqlite3-sys", "log4rs"]
