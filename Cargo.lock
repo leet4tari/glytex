@@ -1351,7 +1351,7 @@ checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
 
 [[package]]
 name = "glytex"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "anyhow",
  "axum",
@@ -4308,6 +4308,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
