@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     convert::TryInto,
     env::current_dir,
     fs::{self, File},
@@ -124,11 +125,13 @@ async fn main() {
         };
 
         error!(target: "tari::p2pool::main", "Panic occurred at {}: {}", location, message);
+        eprintln!("Panic at {}: {}", location, message);
 
         // Optionally, write a custom message directly to the file
         let mut file = File::create("panic.log").unwrap();
         file.write_all(format!("Panic at {}: {}", location, message).as_bytes())
             .unwrap();
+        process::exit(500);
     }));
 
     match main_inner().await {
@@ -605,6 +608,8 @@ async fn run_template_height_watcher(config: ConfigFile, shutdown: ShutdownSigna
 
     let timeout_dur = std::time::Duration::from_secs(config.template_timeout_secs);
     loop {
+        // Sleep first otherwise we call continue a lot
+        sleep(Duration::from_secs(config.height_check_secs)).await;
         if num_failures > config.max_template_failures as u64 {
             error!(target: LOG_TARGET, "Max template failures reached. Exiting.");
             // This is a temporary hack to stop mining
@@ -697,7 +702,6 @@ async fn run_template_height_watcher(config: ConfigFile, shutdown: ShutdownSigna
         // if height > curr_height.load(Ordering::SeqCst) {
         //     curr_height.store(height, Ordering::SeqCst);
         // }
-        sleep(Duration::from_secs(config.height_check_secs)).await;
     }
     Ok(0)
 }
@@ -804,6 +808,8 @@ fn run_thread(
         let mut max_diff = 0;
         let mut last_printed = Instant::now();
         let mut last_reported_stats = Instant::now();
+        let kernel = gpu_engine.create_kernel(&gpu_function)?;
+        let mut num_iterations = 4;
         loop {
             if running_time.elapsed() > Duration::from_secs(10) && benchmark {
                 let hash_rate = (nonce_start - first_nonce) / elapsed.elapsed().as_secs();
@@ -814,8 +820,9 @@ fn run_thread(
                 debug!(target: LOG_TARGET, "Elapsed {:?} > {:?}", elapsed.elapsed().as_secs(), config.template_refresh_secs );
                 break;
             }
-            let num_iterations = 1;
+            let mining_time = Instant::now();
             let result = gpu_engine.mine(
+                &kernel,
                 &gpu_function,
                 &context,
                 &data,
@@ -832,6 +839,11 @@ fn run_thread(
                             * data_buf.as_device_ptr(),
                             * &output_buf, */
             );
+            if mining_time.elapsed().as_secs() > 1500 {
+                num_iterations = cmp::max(1, num_iterations - 1);
+            } else if mining_time.elapsed().as_millis() < 1000 {
+                num_iterations = num_iterations + 1;
+            }
             let (nonce, hashes, diff) = match result {
                 Ok(values) => {
                     debug!(target: LOG_TARGET,

@@ -15,7 +15,7 @@ use opencl3::{
     memory::{Buffer, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY},
     platform::{get_platforms, Platform},
     program::Program,
-    types::{cl_ulong, CL_TRUE},
+    types::{cl_ulong, CL_FALSE, CL_TRUE},
 };
 
 use crate::{
@@ -49,6 +49,7 @@ impl OpenClEngine {
 impl EngineImpl for OpenClEngine {
     type Context = OpenClContext;
     type Function = OpenClFunction;
+    type Kernel = OpenClKernel;
 
     fn init(&mut self) -> Result<(), anyhow::Error> {
         debug!(target: LOG_TARGET, "OpenClEngine: init engine");
@@ -151,9 +152,15 @@ impl EngineImpl for OpenClEngine {
         Ok(OpenClFunction { program })
     }
 
+    fn create_kernel(&self, function: &Self::Function) -> Result<Self::Kernel, anyhow::Error> {
+        let kernel = Kernel::create(&function.program, "sha3")?;
+        Ok(OpenClKernel::new(kernel))
+    }
+
     fn mine(
         &self,
-        function: &Self::Function,
+        kernel: &Self::Kernel,
+        _function: &Self::Function,
         context: &Self::Context,
         data: &[u64],
         min_difficulty: u64,
@@ -164,7 +171,7 @@ impl EngineImpl for OpenClEngine {
     ) -> Result<(Option<u64>, u32, u64), Error> {
         // TODO: put in multiple threads
 
-        let kernels = vec![Kernel::create(&function.program, "sha3").expect("bad kernel")];
+        let kernels = vec![&kernel.kernel];
 
         //  let queue = CommandQueue::create_default_with_properties(
         //     &context.context,
@@ -173,8 +180,7 @@ impl EngineImpl for OpenClEngine {
         // )?;
         unsafe {
             debug!(target: LOG_TARGET, "OpenClEngine: mine unsafe");
-            let queue = CommandQueue::create_default(&context.context, CL_QUEUE_PROFILING_ENABLE)
-                .expect("could not create command queue");
+            let queue = CommandQueue::create_default(&context.context, 0).expect("could not create command queue");
 
             debug!(target: LOG_TARGET, "OpenClEngine: created queue");
 
@@ -195,7 +201,7 @@ impl EngineImpl for OpenClEngine {
                         return Err(e.into());
                     },
                 };
-            match queue.enqueue_write_buffer(&mut buffer, CL_TRUE, 0, data, &[]) {
+            match queue.enqueue_write_buffer(&mut buffer, CL_FALSE, 0, data, &[]) {
                 Ok(_) => debug!(target: LOG_TARGET, "OpenClEngine: buffer created"),
                 Err(e) => {
                     error!(target: LOG_TARGET, "OpenClEngine: failed to enqueue write buffer: {}", e);
@@ -230,7 +236,7 @@ impl EngineImpl for OpenClEngine {
             .set_arg(&output_buffer)
 
             .set_global_work_size((grid_size * block_size) as usize)
-            // .set_local_work_size((grid_size * block_size / 2) as usize)
+            // .set_local_work_size(grid_size as usize)
             // .set_wait_event(&y_write_event)
             .enqueue_nd_range(&queue)
                 {
@@ -340,5 +346,15 @@ impl FunctionImpl for OpenClFunction {
         // let threads = device.max_compute_units()? as u32;
         Ok((kernel.get_work_group_size(device.id())? as u32, 1000))
         // self.program.build(vec![&device], "")?.Ok((1000, 1000))
+    }
+}
+
+pub struct OpenClKernel {
+    pub(crate) kernel: Kernel,
+}
+
+impl OpenClKernel {
+    pub fn new(kernel: Kernel) -> Self {
+        OpenClKernel { kernel }
     }
 }
