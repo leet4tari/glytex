@@ -672,12 +672,12 @@ async fn run_template_height_watcher(config: ConfigFile, shutdown: ShutdownSigna
             {
                 Ok(Ok(template)) => template,
                 Ok(Err(e)) => {
-                    error!(target: LOG_TARGET, "Error getting block template: {:?}", e);
+                    error!(target: LOG_TARGET, "Error getting block template: {}", e);
                     num_failures += 1;
                     continue;
                 },
                 Err(e) => {
-                    error!(target: LOG_TARGET, "Timeout getting block template: {:?}", e);
+                    error!(target: LOG_TARGET, "Timeout getting block template: {}", e);
                     num_failures += 1;
                     continue;
                 },
