@@ -92,7 +92,7 @@
     "target": "x86_64-apple-darwin",
     "cross": false,
     "features": "opencl",
-    "build_enabled": false
+    "build_enabled": true
   },
   {
     "name": "metal-macos-arm64",
